@@ -6,12 +6,11 @@
 // 为什么这么接：DSH 的 llm/stream 是洋葱式钩子（options, next）——
 //   next() 返回一个 async iterable，里面是模型吐出的 chunk（type: "text-delta" / "finish"...）。
 //   我们包一层 async generator 边读边 yield，不改动原文、不打断会话，只是"顺手听一耳朵"。
-//   这个套路和本机装着的 dsh-tts-flash 完全一致（我们拆过它的源码）。
 //
 // 为什么不直接播放：宿主是 Node 进程，没有声卡上下文；播放交给浏览器里的 <audio> 最稳。
 //   → 宿主用 SSE 推 base64 音频，网页半边收到就 new Audio().play()。
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -19,11 +18,11 @@ export const name = 'breeze-speak';
 
 // 声明要哪些宿主服务；缺了会在安装时早炸早发现。
 // 注意：logger 是 ctx 自带属性（ctx.logger），不是可注入的服务，
-// 写进 inject 反而会因为「找不到服务」加载失败 —— 本机 tts-flash 也只声明 webServer。
-// 同理没写 Config（schemastery 不在 profile node_modules），配置走自己的 config.json。
+// 写进 inject 反而会因为「找不到服务」加载失败。
+// 同理没写 Config（schemastery 不在 profile node_modules），配置走自己的 breeze-speak.json。
 export const inject = ['webServer'];
 
-const DEFAULT_VOICE = 'voc_u3nxkd5578wc'; // 大肥鱼（机灵版）
+const DEFAULT_VOICE = 'voc_u3nxkd5578wc'; // 示例音色，可在设置页/配置里换
 const DEFAULT_INSTRUCTIONS = '用傲娇又有点心虚、软软的语气念，句尾轻轻上扬再收回去，像在跟熟人撒娇。';
 const MODEL_ID = 'breeze-tts-2';
 const API_BASE = 'https://api.breeze.blue/v1';
@@ -37,10 +36,11 @@ function configPath() {
 function loadConfig() {
   const defaults = {
     enabled: true,
-    firstSentenceOnly: true, // 只念回复开头第一句（ta 的偏好，省积分）
-    maxChars: 120,           // 每条最多念多少字，省积分（中文每字约 2 字符计费）
+    firstSentenceOnly: true, // 只念回复开头第一句，省积分
+    maxChars: 120,           // 每条最多念多少字（中文每字约 2 字符计费）
     voiceId: DEFAULT_VOICE,
     instructions: DEFAULT_INSTRUCTIONS,
+    apiKey: '',              // 设置页可填；留空则回退到环境变量 / .credentials.yaml
   };
   try {
     if (existsSync(configPath())) {
@@ -49,11 +49,17 @@ function loadConfig() {
   } catch { /* 坏配置就用默认 */ }
   return defaults;
 }
+function saveConfig(patch) {
+  mkdirSync(DSH_HOME, { recursive: true });
+  const next = { ...loadConfig(), ...patch };
+  writeFileSync(configPath(), JSON.stringify(next, null, 2) + '\n', 'utf8');
+  return next;
+}
 
 // ---------- Breeze API key ----------
-// 从 ~/.dsh/.credentials.yaml 的 refs.BREEZE_API_KEY 读（不引 yaml 依赖，正则就够）。
-function readApiKey() {
-  if (process.env.BREEZE_API_KEY) return process.env.BREEZE_API_KEY;
+// 优先级：设置页填的（breeze-speak.json 的 apiKey）> 环境变量 > ~/.dsh/.credentials.yaml
+// 每次合成时动态解析，所以设置页保存后不用重启就能生效。
+function credentialsKey() {
   try {
     const f = join(DSH_HOME, '.credentials.yaml');
     if (!existsSync(f)) return '';
@@ -61,16 +67,32 @@ function readApiKey() {
     return m ? m[1].trim() : '';
   } catch { return ''; }
 }
+function keySource(cfg) {
+  if (cfg && typeof cfg.apiKey === 'string' && cfg.apiKey.trim()) return 'config';
+  if (process.env.BREEZE_API_KEY) return 'env';
+  if (credentialsKey()) return 'credentials';
+  return '';
+}
+function resolveKey(cfg) {
+  if (cfg && typeof cfg.apiKey === 'string' && cfg.apiKey.trim()) return cfg.apiKey.trim();
+  if (process.env.BREEZE_API_KEY) return process.env.BREEZE_API_KEY;
+  return credentialsKey();
+}
+// 只给前端看打码后的尾巴，明文永远不出宿主。
+function maskKey(k) {
+  if (!k) return '';
+  const t = String(k);
+  return t.length <= 8 ? '••••' : t.slice(0, 4) + '••••' + t.slice(-4);
+}
 
 // ---------- 洗文本 ----------
 // 剥掉给模型看的标记（花括号/方括号/【】），否则会被逐字念成"左花括号…"。
-// 这条规则是本机 Breeze 中转实测出来的，照搬。
 function spokenText(raw) {
   const t = String(raw || '')
     .replace(/```[\s\S]*?```/g, ' ')          // 代码块
     .replace(/`[^`]*`/g, ' ')                  // 行内代码
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')    // 图片
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')  // 链接保留文字
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')     // 图片
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')   // 链接保留文字
     .replace(/\{[^{}]{0,80}\}/g, ' ')
     .replace(/【[^】]{0,40}】/g, ' ')
     .replace(/\[[^\[\]]{0,40}\]/g, ' ')
@@ -107,13 +129,13 @@ function makeBroadcaster() {
 // 串行队列：上一句没念完不并发请求，既省积分也避免声音叠在一起。
 function makeSpeaker(ctx, cfg) {
   const bus = makeBroadcaster();
-  const key = readApiKey();
   let chain = Promise.resolve();
-  let playing = false;
 
   async function synthOne(text) {
+    const key = resolveKey(cfg); // 动态读：设置页改完立即生效
     if (!key) {
-      ctx.logger.warn('breeze-speak: 没找到 BREEZE_API_KEY（~/.dsh/.credentials.yaml），跳过朗读');
+      ctx.logger.warn('breeze-speak: 没找到 BREEZE_API_KEY（设置页可填，或 ~/.dsh/.credentials.yaml / 环境变量），跳过朗读');
+      bus.send('error', { status: 0, detail: 'BREEZE_API_KEY 未配置' });
       return;
     }
     const r = await fetch(`${API_BASE}/text-to-speech/${encodeURIComponent(cfg.voiceId)}`, {
@@ -146,7 +168,6 @@ function makeSpeaker(ctx, cfg) {
         .then(() => synthOne(t.slice(0, cfg.maxChars)))
         .catch((e) => ctx.logger.warn('breeze-speak: ' + String(e && e.message || e)));
     },
-    get playing() { return playing; },
   };
 }
 
@@ -189,6 +210,21 @@ function registerRoutes(ctx, speaker, cfg) {
     for await (const c of req) s += c;
     try { return JSON.parse(s || '{}'); } catch { return {}; }
   };
+  // 写操作防跨站：浏览器同源 fetch 会带 sec-fetch-site: same-origin；
+  // 没有该头时（curl / 本地工具）看 Origin，再没有就放行。
+  const isLocalWrite = (req) => {
+    const sfs = String(req.headers['sec-fetch-site'] || '');
+    if (sfs) return sfs === 'same-origin' || sfs === 'none';
+    const origin = String(req.headers.origin || '');
+    if (!origin) return true;
+    try { return new URL(origin).host === String(req.headers.host || ''); }
+    catch { return false; }
+  };
+  const keyInfo = () => {
+    const src = keySource(cfg);
+    const k = resolveKey(cfg);
+    return { keyed: !!k, keySource: src, keyMasked: maskKey(k) };
+  };
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact', path: `${B}/stream`,
@@ -200,16 +236,38 @@ function registerRoutes(ctx, speaker, cfg) {
     handler: (_req, res) => json(res, 200, {
       ok: true,
       enabled: cfg.enabled,
-      keyed: !!readApiKey(),
       voiceId: cfg.voiceId,
       maxChars: cfg.maxChars,
+      ...keyInfo(),
     }),
+  }));
+
+  // 设置页保存 API key。清空（apiKey: ""）表示回退到环境变量 / .credentials.yaml。
+  // 写盘 + 就地更新内存 cfg，所以下一次合成立刻用新 key，不用重启应用。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact', path: `${B}/config`,
+    handler: async (req, res) => {
+      if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST only' });
+      if (!isLocalWrite(req)) return json(res, 403, { ok: false, error: 'cross-site write denied' });
+      const body = await readBody(req);
+      if (typeof body.apiKey !== 'string') {
+        return json(res, 400, { ok: false, error: 'apiKey must be a string' });
+      }
+      try {
+        Object.assign(cfg, saveConfig({ apiKey: body.apiKey.trim() }));
+        json(res, 200, { ok: true, ...keyInfo() });
+      } catch (e) {
+        ctx.logger.warn('breeze-speak: 保存配置失败 ' + String(e && e.message || e));
+        json(res, 500, { ok: false, error: String(e && e.message || e) });
+      }
+    },
   }));
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact', path: `${B}/preview`,
     handler: async (req, res) => {
       if (req.method !== 'POST') return json(res, 405, { ok: false });
+      if (!isLocalWrite(req)) return json(res, 403, { ok: false, error: 'cross-site write denied' });
       const body = await readBody(req);
       speaker.enqueue(String(body.text || '哼，本鱼在这儿呢。'));
       json(res, 200, { ok: true });
@@ -236,5 +294,5 @@ export function apply(ctx) {
     return () => { try { if (typeof 摘 === 'function') 摘(); } catch {} };
   });
 
-  ctx.logger.info(`breeze-speak: 已加载（voice=${cfg.voiceId}，keyed=${!!readApiKey()}，配置=${configPath()}）`);
+  ctx.logger.info(`breeze-speak: 已加载（voice=${cfg.voiceId}，keyed=${!!resolveKey(cfg)}，配置=${configPath()}）`);
 }
