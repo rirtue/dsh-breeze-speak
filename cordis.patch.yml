@@ -1,0 +1,7 @@
+# dsh-breeze-speak —— 把自己插进 profile 的配置树。
+# id 同时是设置页命名空间 / 日志前缀 / 路由前缀，两处要一致。
+- insert:
+    - id: breeze-speak
+      name: 'dsh-breeze-speak'
+      config:
+        enabled: true
