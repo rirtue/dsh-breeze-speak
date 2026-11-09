@@ -14,6 +14,44 @@ window.__ModuleLoader__.load({
     var h = React.createElement;
     var B = '/dsh-breeze-speak';
 
+    // ---------- 请求助手 ----------
+    // 宿主的旧版本/异常会返回 404 或空 body；直接 r.json() 只会抛
+    // "Unexpected end of JSON input"，看不出真因。这里先读文本再解析，
+    // 并把状态码翻成人话（404 通常是改了宿主代码但没重启桌面应用）。
+    function jget(url, opts) {
+      return fetch(url, opts || {}).then(function (r) {
+        return r.text().then(function (txt) {
+          var data = null;
+          if (txt) { try { data = JSON.parse(txt); } catch (e) { data = null; } }
+          if (!r.ok) {
+            var hint = '';
+            if (r.status === 404) hint = '宿主没认出这个接口——多半是改了插件代码但还没真正退出桌面应用重开（新路由要重启才注册）';
+            else if (r.status >= 500) hint = '宿主内部报错';
+            var why = (data && (data.error || data.message)) || (!txt ? '响应是空的' : String(txt).slice(0, 200));
+            var err = new Error('HTTP ' + r.status + '：' + why + (hint ? '（' + hint + '）' : ''));
+            err.status = r.status;
+            err.data = data;
+            throw err;
+          }
+          if (!data) {
+            var e2 = new Error('宿主返回的不是 JSON（' + (txt ? String(txt).slice(0, 120) : '空响应') + '）');
+            e2.status = r.status;
+            throw e2;
+          }
+          return data;
+        });
+      });
+    }
+
+    // POST 走同一套解析；顺带带上本地写入头，宿主用它挡跨站请求。
+    function jpost(url, body) {
+      return jget(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body || {}),
+      });
+    }
+
     // ---------- 音频引擎（SSE 朗读，串行排队） ----------
     var audio = new Audio();
     var currentUrl = null;
@@ -110,8 +148,7 @@ window.__ModuleLoader__.load({
         if (lang) q += '&language_code=' + encodeURIComponent(lang);
         if (gender) q += '&gender=' + encodeURIComponent(gender);
         if (origin) q += '&origin=' + encodeURIComponent(origin);
-        fetch(B + '/voices' + q, { cache: 'no-store' })
-          .then(function (r) { return r.json(); })
+        jget(B + '/voices' + q)
           .then(function (j) {
             if (!j.ok) { setErr(j.error || '拉取失败'); return; }
             setVoices(append ? voices.concat(j.voices) : j.voices);
@@ -119,7 +156,7 @@ window.__ModuleLoader__.load({
             setHasMore(!!j.has_more);
             setPage(p);
           })
-          .catch(function (e) { setErr('拉取失败：' + String(e)); })
+          .catch(function (e) { setErr('拉取失败：' + String(e && e.message || e)); })
           .then(function () { setLoading(false); });
       }
 
@@ -140,31 +177,27 @@ window.__ModuleLoader__.load({
 
       // 用候选音色念一句（合成试听，会消耗一丁点积分；不改已保存的选择）
       function tryVoice(v) {
-        fetch(B + '/preview', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ text: props.text || '哼，本鱼在这儿呢。', voiceId: v.voice_id }),
-        });
-        setNotice('已用《' + v.name + '》念了一句，等 SSE 音频回来…');
+        setNotice('正在用《' + v.name + '》合成…');
+        jpost(B + '/preview', { text: props.text || '哼，本鱼在这儿呢。', voiceId: v.voice_id })
+          .then(function (j) {
+            if (!j.ok) { setNotice('合成失败：' + (j.error || '未知错误')); return; }
+            setNotice('已用《' + v.name + '》念了一句，等音频回来…');
+          })
+          .catch(function (e) { setNotice('合成失败：' + String(e && e.message || e)); });
       }
 
       // 保存选中的音色为默认
       function saveVoice(v) {
         setSaving(true);
         setNotice('');
-        fetch(B + '/voice', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ voiceId: v.voice_id }),
-        })
-          .then(function (r) { return r.json(); })
+        jpost(B + '/voice', { voiceId: v.voice_id })
           .then(function (j) {
             if (j.ok) {
               setNotice('已把《' + v.name + '》设为我的音色，下句朗读立即生效');
               if (props.onSaved) props.onSaved();
             } else setNotice('保存失败：' + (j.error || '未知错误'));
           })
-          .catch(function (e) { setNotice('保存失败：' + String(e)); })
+          .catch(function (e) { setNotice('保存失败：' + String(e && e.message || e)); })
           .then(function () { setSaving(false); });
       }
 
@@ -271,10 +304,14 @@ window.__ModuleLoader__.load({
       var busySaving = saving[0], setBusySaving = saving[1];
 
       function loadState() {
-        fetch(B + '/state', { cache: 'no-store' })
-          .then(function (r) { return r.json(); })
+        jget(B + '/state')
           .then(setInfo)
-          .catch(function () {});
+          .catch(function (e) {
+            // 旧宿主可能连 /state 的老字段都没有新值，不打扰用户，但留一条可见提示。
+            setInfo(function (prev) {
+              return Object.assign({}, prev, { __err: String(e && e.message || e) });
+            });
+          });
       }
 
       React.useEffect(function () {
@@ -286,12 +323,7 @@ window.__ModuleLoader__.load({
       function saveKey(clear) {
         setBusySaving(true);
         setNotice('');
-        fetch(B + '/config', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ apiKey: clear ? '' : keyInput }),
-        })
-          .then(function (r) { return r.json(); })
+        jpost(B + '/config', { apiKey: clear ? '' : keyInput })
           .then(function (j) {
             if (j.ok) {
               setKeyInput('');
@@ -303,16 +335,14 @@ window.__ModuleLoader__.load({
               setNotice('保存失败：' + (j.error || '未知错误'));
             }
           })
-          .catch(function (e) { setNotice('保存失败：' + String(e)); })
+          .catch(function (e) { setNotice('保存失败：' + String(e && e.message || e)); })
           .then(function () { setBusySaving(false); });
       }
 
       var test = function () {
-        fetch(B + '/preview', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ text: draft }),
-        });
+        jpost(B + '/preview', { text: draft })
+          .then(function () {})
+          .catch(function (e) { setNotice('试听失败：' + String(e && e.message || e)); });
       };
 
       var srcLabel = {
