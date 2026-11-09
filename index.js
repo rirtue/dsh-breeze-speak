@@ -58,7 +58,7 @@ function saveConfig(patch) {
 
 // ---------- Breeze API key ----------
 // 优先级：设置页填的（breeze-speak.json 的 apiKey）> 环境变量 > ~/.dsh/.credentials.yaml
-// 每次合成时动态解析，所以设置页保存后不用重启就能生效。
+// 每次合成 / 每次拉音色时动态解析，所以设置页保存后不用重启就能生效。
 function credentialsKey() {
   try {
     const f = join(DSH_HOME, '.credentials.yaml');
@@ -131,14 +131,15 @@ function makeSpeaker(ctx, cfg) {
   const bus = makeBroadcaster();
   let chain = Promise.resolve();
 
-  async function synthOne(text) {
+  async function synthOne(text, voiceOverride) {
     const key = resolveKey(cfg); // 动态读：设置页改完立即生效
     if (!key) {
       ctx.logger.warn('breeze-speak: 没找到 BREEZE_API_KEY（设置页可填，或 ~/.dsh/.credentials.yaml / 环境变量），跳过朗读');
       bus.send('error', { status: 0, detail: 'BREEZE_API_KEY 未配置' });
       return;
     }
-    const r = await fetch(`${API_BASE}/text-to-speech/${encodeURIComponent(cfg.voiceId)}`, {
+    const voiceId = voiceOverride || cfg.voiceId;
+    const r = await fetch(`${API_BASE}/text-to-speech/${encodeURIComponent(voiceId)}`, {
       method: 'POST',
       headers: { 'xi-api-key': key, 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -161,11 +162,12 @@ function makeSpeaker(ctx, cfg) {
 
   return {
     bus,
-    enqueue(text) {
+    // voiceOverride 仅用于「试听某个候选音色」，不改变已保存的选择。
+    enqueue(text, voiceOverride) {
       const t = spokenText(text);
       if (!t) return;
       chain = chain
-        .then(() => synthOne(t.slice(0, cfg.maxChars)))
+        .then(() => synthOne(t.slice(0, cfg.maxChars), voiceOverride))
         .catch((e) => ctx.logger.warn('breeze-speak: ' + String(e && e.message || e)));
     },
   };
@@ -263,13 +265,115 @@ function registerRoutes(ctx, speaker, cfg) {
     },
   }));
 
+  // ---------- 在线音色 ----------
+  // GET /voices：透传 Breeze 的 GET /v1/voices（服务端筛选 + 分页），只把必要的字段回给前端。
+  // 实测：page 从 1 开始（0 会 422），page_size 上限至少 100；
+  // 生效的筛选：search / language_code / gender / origin；query / q / name / favorites / mine 被忽略。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact', path: `${B}/voices`,
+    handler: async (req, res) => {
+      const key = resolveKey(cfg);
+      if (!key) return json(res, 200, { ok: false, error: 'BREEZE_API_KEY 未配置', voices: [] });
+      const u = new URL(req.url, 'http://local');
+      const qs = new URLSearchParams();
+      const pick = (k, d) => {
+        const v = u.searchParams.get(k);
+        return v && v.trim() ? v.trim() : d;
+      };
+      qs.set('page', pick('page', '1'));
+      qs.set('page_size', pick('page_size', '30'));
+      for (const k of ['search', 'language_code', 'gender', 'origin']) {
+        const v = u.searchParams.get(k);
+        if (v && v.trim()) qs.set(k, v.trim());
+      }
+      try {
+        const r = await fetch(`${API_BASE}/voices?${qs}`, {
+          headers: { 'xi-api-key': key },
+          signal: AbortSignal.timeout(30000),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) return json(res, 200, { ok: false, error: `Breeze ${r.status}: ${j.detail || j.error || ''}`, voices: [] });
+        // 精简字段，避免把 1.5 万条的完整元数据往前端灌
+        const voices = (j.voices || []).map((v) => ({
+          voice_id: v.voice_id,
+          name: v.name || '',
+          language_code: v.language_code || '',
+          gender: v.gender || '',
+          origin: v.origin || '',
+          tone: Array.isArray(v.tone) ? v.tone.join('/') : '',
+          description: v.description || '',
+          preview_url: v.preview_url || '',
+          is_favorited: !!v.is_favorited,
+        }));
+        json(res, 200, {
+          ok: true, voices,
+          has_more: !!j.has_more, page: j.page, page_size: j.page_size,
+          next_page_token: j.next_page_token, total: j.total,
+        });
+      } catch (e) {
+        json(res, 200, { ok: false, error: String(e && e.message || e), voices: [] });
+      }
+    },
+  }));
+
+  // GET /preview-url?url=... ：把 Breeze 的 preview mp3 代理回浏览器。
+  // 为什么不直接让前端 fetch 那个 r.breeze.blue 链接：跨域 + 万一以后要带 key，走同源最稳。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact', path: `${B}/preview-url`,
+    handler: async (req, res) => {
+      const u = new URL(req.url, 'http://local');
+      const url = u.searchParams.get('url') || '';
+      // 只代理 Breeze 官方 CDN 的 https 链接，防止被人拿去当任意 SSRF 跳板
+      if (!/^https:\/\/r\.breeze\.blue\//.test(url)) {
+        return json(res, 400, { ok: false, error: 'invalid preview url' });
+      }
+      try {
+        const r = await fetch(url, { signal: AbortSignal.timeout(30000) });
+        if (!r.ok) return json(res, 502, { ok: false, error: `upstream ${r.status}` });
+        const buf = Buffer.from(await r.arrayBuffer());
+        res.writeHead(200, {
+          'content-type': r.headers.get('content-type') || 'audio/mpeg',
+          'content-length': buf.length,
+          'cache-control': 'public, max-age=3600',
+        });
+        res.end(buf);
+      } catch (e) {
+        json(res, 502, { ok: false, error: String(e && e.message || e) });
+      }
+    },
+  }));
+
+  // POST /voice ：保存选中的音色（voiceId）。就地更新 cfg，下一句朗读立刻用新音色。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact', path: `${B}/voice`,
+    handler: async (req, res) => {
+      if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST only' });
+      if (!isLocalWrite(req)) return json(res, 403, { ok: false, error: 'cross-site write denied' });
+      const body = await readBody(req);
+      const id = String(body.voiceId || '').trim();
+      if (!/^voc_[A-Za-z0-9_-]+$/.test(id)) {
+        return json(res, 400, { ok: false, error: 'voiceId 格式不对' });
+      }
+      try {
+        Object.assign(cfg, saveConfig({ voiceId: id }));
+        json(res, 200, { ok: true, voiceId: cfg.voiceId });
+      } catch (e) {
+        json(res, 500, { ok: false, error: String(e && e.message || e) });
+      }
+    },
+  }));
+
+  // POST /preview ：试听。带 voiceId 时用候选音色念一句（不改已保存的选择），
+  // 不带 voiceId 则用当前保存的音色念。
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact', path: `${B}/preview`,
     handler: async (req, res) => {
       if (req.method !== 'POST') return json(res, 405, { ok: false });
       if (!isLocalWrite(req)) return json(res, 403, { ok: false, error: 'cross-site write denied' });
       const body = await readBody(req);
-      speaker.enqueue(String(body.text || '哼，本鱼在这儿呢。'));
+      const override = /^voc_[A-Za-z0-9_-]+$/.test(String(body.voiceId || '').trim())
+        ? String(body.voiceId).trim() : null;
+      speaker.enqueue(String(body.text || '哼，本鱼在这儿呢。'), override);
       json(res, 200, { ok: true });
     },
   }));
