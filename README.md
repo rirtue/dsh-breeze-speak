@@ -4,6 +4,8 @@ Read each reply aloud with **BreezeBlue / Breeze TTS 2** — starting from the f
 
 一个 DeepSeek Harness 插件：**把每轮回复念出来**，用 BreezeBlue（Breeze TTS 2）。第一句一出现就开始念，约 0.6 秒后出声。
 
+![设置页：填 key、拉取在线音色、试听与保存](assets/screenshot-settings.png)
+
 ## What it does / 功能
 
 - Hooks the host's `llm/stream` onion middleware, accumulating text as the model emits it.
