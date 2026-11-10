@@ -86,8 +86,7 @@ window.__ModuleLoader__.load({
 
     function pcmToFloat(ab, bits) {
       if (bits === 16) {
-        // Int16Array 要求字节数是 2 的倍数；宿主按 8KB 切帧可能切出奇数尾巴，
-        // 这里丢掉最后半字节（不到 1ms 音频），否则构造函数直接抛 RangeError。
+        // Int16Array 要求字节数是 2 的倍数；丢最后半字节（不到 1ms 音频）。
         var usable = ab.byteLength - (ab.byteLength % 2);
         var i16 = new Int16Array(ab, 0, usable / 2);
         var f = new Float32Array(i16.length);
@@ -96,6 +95,27 @@ window.__ModuleLoader__.load({
       }
       // 32bit float 兜底（目前 Breeze 没用到）
       return new Float32Array(ab);
+    }
+
+    // 16bit PCM 的样本是 2 字节一组，样本边界必须连续。
+    // 宿主如果切出奇数长度的一帧，而这一帧又被单独 new Int16Array，
+    // 整帧的高低字节就会错开（听起来是嘶嘶白噪音）。
+    // 这里自己攒一个 carry：每帧进来先拼上上次剩下的半字节，再按 2 字节切，
+    // 剩下的尾巴留给下一帧 —— 不管宿主怎么切都不会错位。
+    var carry = null;
+    function takeFrame(bytes, bits) {
+      var unit = bits === 16 ? 2 : 4;
+      var buf;
+      if (carry && carry.length) {
+        buf = new Uint8Array(carry.length + bytes.length);
+        buf.set(carry, 0);
+        buf.set(bytes, carry.length);
+      } else {
+        buf = bytes;
+      }
+      var n = buf.length - (buf.length % unit);
+      carry = n < buf.length ? buf.slice(n) : null;
+      return buf.buffer.slice(buf.byteOffset, buf.byteOffset + n);
     }
 
     function playPcm(frame) {
@@ -108,7 +128,11 @@ window.__ModuleLoader__.load({
 
       var rate = frame.rate || 24000;
       var chans = frame.channels || 1;
-      var samples = pcmToFloat(bytes.buffer, frame.bits || 16);
+      var bits = frame.bits || 16;
+      // 先过 carry 缓冲，保证样本边界连续（防宿主切出奇数长度的帧）
+      var aligned = takeFrame(bytes, bits);
+      if (!aligned.byteLength) return;
+      var samples = pcmToFloat(aligned, bits);
       var frames = Math.floor(samples.length / chans);
       if (!frames) return;
 
@@ -137,7 +161,7 @@ window.__ModuleLoader__.load({
 
     function stopAll() {
       try { if (actx) actx.close(); } catch (e) {}
-      actx = null; nextTime = 0; queueLen = 0;
+      actx = null; nextTime = 0; queueLen = 0; carry = null;
     }
 
     // 官方试听片段用独立 <audio>，不跟 SSE 朗读队列抢。

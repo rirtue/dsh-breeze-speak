@@ -175,12 +175,18 @@ function makeSpeaker(ctx, cfg) {
     const flush = (force) => {
       const need = force ? 2 : (sentAny ? FLUSH : 512);
       if (pending.length < need) return;
+      // 16bit PCM 一个样本 2 字节，帧长**必须是偶数**。
+      // 前端对每一帧单独 new Int16Array，帧长一旦是奇数，后续帧的样本边界
+      // 就会整体错开一个字节（高低字节互换）→ 嘶嘶白噪音。
+      // 这里把尾巴留到下一帧，保证每一帧都落在样本边界上。
+      const n = pending.length - (pending.length % 2);
+      if (n < 2) return;
       bus.send('pcm', {
-        audio: pending.toString('base64'),
+        audio: pending.subarray(0, n).toString('base64'),
         rate: PCM_RATE, bits: PCM_BITS, channels: PCM_CHANNELS,
       });
       sentAny = true;
-      pending = Buffer.alloc(0);
+      pending = Buffer.from(pending.subarray(n));
     };
 
     const reader = r.body.getReader();
