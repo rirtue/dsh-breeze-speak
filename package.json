@@ -1,7 +1,7 @@
 {
   "name": "dsh-breeze-speak",
-  "version": "0.1.0",
-  "description": "最小可用的 DSH 插件示例：读取本轮回复内容，用 BreezeBlue / Breeze TTS 2 念出来。",
+  "version": "1.0.0",
+  "description": "Reads each reply aloud with BreezeBlue / Breeze TTS 2: streams raw PCM over the /stream endpoint and plays it with Web Audio, so the first sentence starts ~0.6s after it appears. Settings page for API key and 15k+ online voices.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -36,10 +36,29 @@
     }
   },
   "keywords": [
+    "dsh",
     "dsh-plugin",
     "deepseek-harness",
     "breeze",
-    "tts"
+    "breezeblue",
+    "tts",
+    "text-to-speech",
+    "voice",
+    "speech",
+    "pcm",
+    "web-audio"
   ],
-  "license": "MIT"
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rirtue/dsh-breeze-speak.git"
+  },
+  "homepage": "https://github.com/rirtue/dsh-breeze-speak#readme",
+  "bugs": {
+    "url": "https://github.com/rirtue/dsh-breeze-speak/issues"
+  },
+  "author": "rirtue",
+  "license": "MIT",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org"
+  }
 }
