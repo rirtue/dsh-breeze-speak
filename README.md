@@ -96,8 +96,16 @@ Changing `maxChars` / `instructions` / `firstSentenceOnly` needs a **real app re
 - `POST /voice` —— `{voiceId}`, saves the selected voice (effective immediately)
 - `POST /preview` —— `{text, voiceId?}`, synthesizes one line right away (`voiceId` previews a candidate without changing the saved choice)
 
-Writes are guarded against cross-site requests (`sec-fetch-site` / `Origin` check). The plaintext key stays on the host; the web half only gets audio and a masked string.
-写操作带跨站防护（`sec-fetch-site` / `Origin` 校验），明文 key 只在宿主，网页半边只收音频和打码串。
+Every handler runs an **admission fence** first: `ctx.connection.requestRejection(req)` applies DSH's Host/Origin fence and requires an authenticated live Peer, returning `401`/`403` otherwise. This is needed because routes registered through `ctx.webServer.register` do **not** pass through the Connection fence on their own — only the `/api` gateway and exact `ctx.connection.fetch.register` routes do. Without it, `/stream` is an open SSE feed anyone can connect to and read the spoken audio, and `/voices` would spend the user's Breeze key on their behalf.
+
+The fence can be bypassed by nothing on a normal browser, but note it also means a plain `curl` from a shell has no authenticated Peer and gets `401`; use the settings page, or an API token, to reach these routes.
+
+每个 handler 入口先过一道**准入围栏**：`ctx.connection.requestRejection(req)` 会做 DSH 的 Host/Origin 围栏并要求一个已认证的存活 Peer，否则返回 `401`/`403`。之所以必须自己补这一层：走 `ctx.webServer.register` 挂的路由**不经过** Connection 围栏——只有 `/api` 网关和 `ctx.connection.fetch.register` 的精确路由才过。缺了它，`/stream` 就是谁连上谁都能读的公开 SSE 音频流，`/voices` 也会被拿去花用户的 Breeze Key。
+
+副作用：从 shell 直接 `curl` 拿不到已认证 Peer，会收到 `401`；要访问这些路由请用设置页（或带 API token）。
+
+Writes additionally check `sec-fetch-site` / `Origin` against cross-site requests. The plaintext key stays on the host; the web half only gets audio and a masked string.
+写操作另外校验 `sec-fetch-site` / `Origin` 挡跨站请求。明文 key 只在宿主，网页半边只收音频和打码串。
 
 ## Why `/stream` (latency, measured) / 为什么用 `/stream`（延迟实测）
 

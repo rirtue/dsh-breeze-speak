@@ -20,7 +20,8 @@ export const name = 'breeze-speak';
 // 注意：logger 是 ctx 自带属性（ctx.logger），不是可注入的服务，
 // 写进 inject 反而会因为「找不到服务」加载失败。
 // 同理没写 Config（schemastery 不在 profile node_modules），配置走自己的 breeze-speak.json。
-export const inject = ['webServer'];
+// connection：用来做路由准入围栏（requestRejection）。见下面 admit() 的说明。
+export const inject = ['webServer', 'connection'];
 
 const DEFAULT_VOICE = 'voc_u3nxkd5578wc'; // 示例音色，可在设置页/配置里换
 const DEFAULT_INSTRUCTIONS = '用傲娇又有点心虚、软软的语气念，句尾轻轻上扬再收回去，像在跟熟人撒娇。';
@@ -298,6 +299,31 @@ function registerRoutes(ctx, speaker, cfg) {
     try { return new URL(origin).host === String(req.headers.host || ''); }
     catch { return false; }
   };
+
+  // ---------- 准入围栏 ----------
+  // ctx.webServer.register 挂的路由**不经过** DSH 的 Connection 围栏：只有 /api 网关和
+  // ctx.connection.fetch.register 的精确路由才过。所以这里自己补一层。
+  //
+  // 为什么必须有：/stream 是 SSE，谁连上谁就能收到朗读音频；/voices 会拿用户的
+  // Breeze Key 去调上游。光靠 isLocalWrite 不够 —— 没有 Sec-Fetch-Site / Origin 的请求
+  // 一律放行，而 DNS 重绑定下浏览器发的请求恰好同源，就能绕过。
+  //
+  // requestRejection(req) 做的事：Host/Origin 围栏（trustedHosts）+ 要求一个已认证的
+  // 存活 Peer；不满足时返回 401 / 403，满足时返回 undefined。
+  const admit = (req, res) => {
+    let rejection;
+    try {
+      const connection = ctx.get('connection');
+      rejection = connection?.requestRejection?.(req);
+    } catch {
+      // 老版本宿主没有这个服务：退回原来的启发式，至少挡住明显的跨站写。
+      return isLocalWrite(req) ? true : (json(res, 403, { ok: false, error: 'forbidden' }), false);
+    }
+    if (rejection === undefined) return true;
+    json(res, rejection, { ok: false, error: rejection === 401 ? 'unauthorized' : 'forbidden' });
+    return false;
+  };
+
   const keyInfo = () => {
     const src = keySource(cfg);
     const k = resolveKey(cfg);
@@ -306,18 +332,21 @@ function registerRoutes(ctx, speaker, cfg) {
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact', path: `${B}/stream`,
-    handler: (req, res) => { speaker.bus.add(res); },
+    handler: (req, res) => { if (!admit(req, res)) return; speaker.bus.add(res); },
   }));
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact', path: `${B}/state`,
-    handler: (_req, res) => json(res, 200, {
-      ok: true,
-      enabled: cfg.enabled,
-      voiceId: cfg.voiceId,
-      maxChars: cfg.maxChars,
-      ...keyInfo(),
-    }),
+    handler: (req, res) => {
+      if (!admit(req, res)) return;
+      json(res, 200, {
+        ok: true,
+        enabled: cfg.enabled,
+        voiceId: cfg.voiceId,
+        maxChars: cfg.maxChars,
+        ...keyInfo(),
+      });
+    },
   }));
 
   // 设置页保存 API key。清空（apiKey: ""）表示回退到环境变量 / .credentials.yaml。
@@ -325,6 +354,7 @@ function registerRoutes(ctx, speaker, cfg) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact', path: `${B}/config`,
     handler: async (req, res) => {
+      if (!admit(req, res)) return;
       if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST only' });
       if (!isLocalWrite(req)) return json(res, 403, { ok: false, error: 'cross-site write denied' });
       const body = await readBody(req);
@@ -348,6 +378,7 @@ function registerRoutes(ctx, speaker, cfg) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact', path: `${B}/voices`,
     handler: async (req, res) => {
+      if (!admit(req, res)) return;
       const key = resolveKey(cfg);
       if (!key) return json(res, 200, { ok: false, error: 'BREEZE_API_KEY 未配置', voices: [] });
       const u = new URL(req.url, 'http://local');
@@ -397,6 +428,7 @@ function registerRoutes(ctx, speaker, cfg) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact', path: `${B}/preview-url`,
     handler: async (req, res) => {
+      if (!admit(req, res)) return;
       const u = new URL(req.url, 'http://local');
       const url = u.searchParams.get('url') || '';
       // 只代理 Breeze 官方 CDN 的 https 链接，防止被人拿去当任意 SSRF 跳板
@@ -423,6 +455,7 @@ function registerRoutes(ctx, speaker, cfg) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact', path: `${B}/voice`,
     handler: async (req, res) => {
+      if (!admit(req, res)) return;
       if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST only' });
       if (!isLocalWrite(req)) return json(res, 403, { ok: false, error: 'cross-site write denied' });
       const body = await readBody(req);
@@ -444,6 +477,7 @@ function registerRoutes(ctx, speaker, cfg) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact', path: `${B}/preview`,
     handler: async (req, res) => {
+      if (!admit(req, res)) return;
       if (req.method !== 'POST') return json(res, 405, { ok: false });
       if (!isLocalWrite(req)) return json(res, 403, { ok: false, error: 'cross-site write denied' });
       const body = await readBody(req);
