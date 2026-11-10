@@ -27,6 +27,12 @@ const DEFAULT_INSTRUCTIONS = '用傲娇又有点心虚、软软的语气念，�
 const MODEL_ID = 'breeze-tts-2';
 const API_BASE = 'https://api.breeze.blue/v1';
 
+// /stream 端点吐的是裸 PCM，没有 WAV 头告诉你格式。实测反推：
+// MP3 同为 3.648s，PCM 172800 字节 ⇒ 47368 B/s ≈ 24000 × 2（16bit 单声道）。
+const PCM_RATE = 24000;
+const PCM_BITS = 16;
+const PCM_CHANNELS = 1;
+
 const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh');
 
 // ---------- 配置 ----------
@@ -139,7 +145,11 @@ function makeSpeaker(ctx, cfg) {
       return;
     }
     const voiceId = voiceOverride || cfg.voiceId;
-    const r = await fetch(`${API_BASE}/text-to-speech/${encodeURIComponent(voiceId)}`, {
+
+    // 用 /stream 端点：它吐 audio/pcm 原始流，首包只要 ~0.6 秒；
+    // 普通端点要等整段 mp3 编完才返回（~2.1 秒），首声差 3 倍多。
+    // PCM 格式实测 24000Hz / 16bit / 单声道（见 README「为什么用 /stream」）。
+    const r = await fetch(`${API_BASE}/text-to-speech/${encodeURIComponent(voiceId)}/stream`, {
       method: 'POST',
       headers: { 'xi-api-key': key, 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -156,8 +166,32 @@ function makeSpeaker(ctx, cfg) {
       bus.send('error', { status: r.status, detail });
       return;
     }
-    const buf = Buffer.from(await r.arrayBuffer());
-    bus.send('audio', { audio: buf.toString('base64'), mime: 'audio/mpeg', text });
+
+    // 边收边推：第一帧有多少推多少（让声音尽早出来），之后攒到 ~8KB（约 170ms 音频）
+    // 再发，避免把浏览器灌成一堆碎渣。剩下的尾巴在结束时补发。
+    const FLUSH = 8192;
+    let pending = Buffer.alloc(0);
+    let sentAny = false;
+    const flush = (force) => {
+      const need = force ? 2 : (sentAny ? FLUSH : 512);
+      if (pending.length < need) return;
+      bus.send('pcm', {
+        audio: pending.toString('base64'),
+        rate: PCM_RATE, bits: PCM_BITS, channels: PCM_CHANNELS,
+      });
+      sentAny = true;
+      pending = Buffer.alloc(0);
+    };
+
+    const reader = r.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      pending = pending.length ? Buffer.concat([pending, Buffer.from(value)]) : Buffer.from(value);
+      flush(false);
+    }
+    flush(true);
+    bus.send('pcm-end', { text });
   }
 
   return {
@@ -174,27 +208,63 @@ function makeSpeaker(ctx, cfg) {
 }
 
 // ---------- 包装 llm/stream ----------
+// 关键：**第一句一凑齐就立刻发起合成**，不等整条回复写完。
+// 改之前是 finally 里才合成 —— 用户要等「全文生成完 + 2~3 秒 Breeze 合成」，
+// 长回复就是十几秒的哑巴。现在把 2~3 秒的合成藏进后面的生成时间里。
 function tapReply(ctx, speaker, inner, cfg) {
   let buf = '';
-  // 按"第一句"截断：只念回复开头，剩的全丢（firstSentenceOnly 可关，改成念整条的前 maxChars 字）。
-  const cut = () => {
-    if (cfg.firstSentenceOnly) {
-      const m = /^([\s\S]*?[。！？!?；;…\n])/.exec(buf);
-      return (m ? m[1] : buf).trim();
-    }
-    return buf.trim();
+  let fired = false;
+
+  // 去掉开头的空白/列表符：回复常以换行、#、- 开头，否则正则会先撞上那个换行。
+  const clean = () => buf.trimStart().replace(/^[#>*\-\s]+/, '');
+
+  // 首句：找到句末标点才返回；还没到句末就返回 ''（继续等，别把半句提前念了）。
+  const firstSentence = () => {
+    const m = /^([\s\S]*?[。！？!?；;…\n])/.exec(clean());
+    return m ? m[1].trim() : '';
   };
+
+  // 触发一次朗读（只触发一次）。reason 只用于日志。
+  const fire = (reason) => {
+    if (fired) return;
+    const limit = Math.max(20, Number(cfg.maxChars) || 120);
+    let text;
+    if (cfg.firstSentenceOnly) {
+      text = firstSentence();
+      if (!text) {
+        // 首句特别长（一直没有句末标点）时别让用户干等：攒够 40 字就先念这一段。
+        const c = clean();
+        if (c.length < 40) return;
+        text = c.slice(0, 40);
+      }
+    } else {
+      if (clean().length < limit) return;
+      text = clean();
+    }
+    fired = true;
+    const spoken = text.slice(0, limit);
+    ctx.logger.info?.(`breeze-speak: 提前合成（${reason}，${spoken.length} 字）`);
+    if (spoken) speaker.enqueue(spoken);   // enqueue 内部会做 spokenText 清洗
+  };
+
   return (async function* () {
     try {
       for await (const chunk of inner) {
         if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') {
           buf += chunk.text;
+          // 每来一小段就尝试一次：首句一到手就立刻开合成，与后续文字重叠。
+          if (!fired && buf.length >= 4) fire('首句完成');
         }
         yield chunk;   // 原样透传，绝不改动会话内容
       }
     } finally {
-      const text = cut();
-      if (text) speaker.enqueue(text);
+      // 兜底：整条流完了还没触发（比如回复里一句号都没有），这时把攒到的念掉。
+      if (!fired) {
+        const limit = Math.max(20, Number(cfg.maxChars) || 120);
+        const text = cfg.firstSentenceOnly ? (firstSentence() || clean()) : clean();
+        const spoken = text.slice(0, limit);
+        if (spoken) { fired = true; speaker.enqueue(spoken); }
+      }
     }
   })();
 }

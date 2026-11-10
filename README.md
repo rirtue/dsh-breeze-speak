@@ -5,10 +5,11 @@
 功能：
 
 - 挂住宿主 `llm/stream` 洋葱钩子，把模型吐出的文字攒起来；
+- **第一句一凑齐就立刻发起合成**，不等整条回复写完 —— 那 0.6~1.3 秒的合成时间被藏进后续文字生成里；
 - 默认只念**回复开头第一句**（可在配置里关掉），省 Breeze 积分；
 - 送给 Breeze 前剥掉代码块 / 花括号 / 方括号标记，免得被逐字念成「左花括号…」；
 - 跳过插件自己发起的模型调用（如心情判定 JSON），不会串音；
-- 宿主合成 mp3 → SSE 推给网页半边 → 浏览器 `<audio>` 播放；
+- 走 Breeze 的 **`/stream` 端点拿 PCM 裸流**，边收边推给网页半边，用 Web Audio 排时间轴连续播（不是等整段 mp3 编完再播）；
 - **设置页里能直接填 Breeze API Key**（填完立即生效、不用重启）；
 - **拉取在线音色**并按名字/语言/性别/来源筛选、分页，**选一个保存为默认音色**，并可试听：
   - 「▶ 官方试听」播放 Breeze 自带的预览片段（免费、不花积分）；
@@ -55,7 +56,7 @@
 
 ## HTTP 路由（都在 `/dsh-breeze-speak/` 下）
 
-- `GET  /stream` —— SSE，推 `audio` 帧 `{audio, mime, text}` 与 `error` 帧
+- `GET  /stream` —— SSE，推 `pcm` 帧 `{audio(base64), rate, bits, channels}`、收尾 `pcm-end` 帧与 `error` 帧
 - `GET  /state`  —— `{ok, enabled, voiceId, maxChars, keyed, keySource, keyMasked}`（key 只回打码尾巴）
 - `POST /config` —— `{apiKey}`，保存/清空 Breeze key（写 `breeze-speak.json`，就地生效）
 - `GET  /voices` —— `?page=1&page_size=24&search=&language_code=&gender=&origin=`，透传 Breeze 音色库；
@@ -66,7 +67,31 @@
 - `POST /voice` —— `{voiceId}`，保存选中的音色（就地生效）
 - `POST /preview` —— `{text, voiceId?}`，立刻合成并播放一句（带 `voiceId` 时用该候选音色试听，不改已存选择）
 
-写操作带跨站防护（`sec-fetch-site` / `Origin` 校验），明文 key 只在宿主，网页半边只收 mp3 和打码串。
+写操作带跨站防护（`sec-fetch-site` / `Origin` 校验），明文 key 只在宿主，网页半边只收音频和打码串。
+
+## 为什么用 `/stream`（延迟实测）
+
+改之前是「整条回复流完 → 调普通 TTS 端点（整段 mp3，等 2.1~2.8 秒）→ 网页 `<audio>` 播」，
+用户实际要等 **全文生成 + 2 秒多** 才听到第一个字。
+
+现在两处一起改：
+
+1. **提前触发**：`llm/stream` 每来一小段文字就检查一次，首句（第一个 `。！？；…` 或换行）一凑齐立刻发起合成，不再等 `finally`。
+2. **改用 `/stream` 端点 + PCM 流播**：首包只要 **0.55~1.3 秒**（普通端点 2.1~2.8 秒），边收边推、Web Audio 排时间轴连续播放。
+
+实测（`breeze-tts-2`、13 字中文）：
+
+| 方式 | 首声到达 |
+| --- | --- |
+| 整段 mp3 端点（旧） | ~2100–2800 ms |
+| `/stream` PCM（新） | **~550–1350 ms** |
+
+PCM 裸流没有 WAV 头，格式是反推出来的：同一句的 MP3 时长 3.648 s、PCM 172800 字节
+⇒ 47368 B/s ⇒ **24000 Hz / 16 bit / 单声道**（见 `index.js` 的 `PCM_RATE/PCM_BITS/PCM_CHANNELS`）。
+
+注意：`/stream` 端点返回 `content-type: audio/pcm`，别加 `stream`/`speed`/`output_format`/`optimize_latency`
+这些 body 字段（会 422 `Extra inputs are not permitted`）；`guidance_scale` 越大首包越快（4.0 约 570 ms，
+1.0 约 1270 ms），所以维持 4.0。
 
 ## 安装
 
@@ -96,6 +121,6 @@ CLI 会做两件事：把包名加进 `package.json` 的 `dsh.profile.bundles`�
 - **不改会话内容**：钩子包一层 async generator，边读边 `yield` 原文，只在 `finally` 里取开头一句去念。
 - **不引 schemastery**：profile 的 `node_modules` 里没有那个包，写 `Config` 会让插件加载失败；
   配置全走自己的 `breeze-speak.json`。
-- **不碰密钥到前端**：Breeze key 只在宿主读，网页半边只收 mp3 和打码串，避免跨站泄露。
+- **不碰密钥到前端**：Breeze key 只在宿主读，网页半边只收音频（PCM 帧）和打码串，避免跨站泄露。
 - **不把 1.5 万条音色灌给前端**：服务端筛选 + 分页，宿主只回精简字段；官方预览 mp3 走同源代理。
 - **串行队列**：一句念完再请求下一句，不并发、不叠音、不烧积分。

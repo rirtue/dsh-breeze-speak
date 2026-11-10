@@ -52,34 +52,92 @@ window.__ModuleLoader__.load({
       });
     }
 
-    // ---------- 音频引擎（SSE 朗读，串行排队） ----------
-    var audio = new Audio();
-    var currentUrl = null;
-    var pending = [];
-    var busy = false;
+    // ---------- 音频引擎（SSE 朗读） ----------
+    // 宿主推的是 PCM 裸流（24000Hz/16bit/单声道），不是 mp3 —— 因为 Breeze 的
+    // /stream 端点首包只要 0.6 秒，而整段 mp3 要 2.1 秒。这里把陆续到达的 PCM
+    // 喂进 Web Audio 的 AudioBufferSourceNode，排成一条时间轴连续播。
+    var actx = null;
+    var nextTime = 0;        // 下一段该排到哪个时刻（actx.currentTime 坐标系）
+    var queueLen = 0;        // 已排但还没播完的段数
 
-    function playFrame(frame) {
-      pending.push(frame);
-      if (!busy) pump();
-    }
-    function pump() {
-      if (!pending.length) { busy = false; return; }
-      busy = true;
-      var f = pending.shift();
-      try {
-        var bin = atob(f.audio || '');
-        var bytes = new Uint8Array(bin.length);
-        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        if (currentUrl) URL.revokeObjectURL(currentUrl);
-        currentUrl = URL.createObjectURL(new Blob([bytes], { type: f.mime || 'audio/mpeg' }));
-        audio.src = currentUrl;
-        audio.onended = function () { pump(); };
-        audio.onerror = function () { pump(); };
-        var p = audio.play();
-        if (p && p.catch) p.catch(function () { pump(); });
-      } catch (e) {
-        pump();
+    function ensureCtx() {
+      if (!actx) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        try { actx = new AC(); } catch (e) { return null; }
       }
+      if (actx.state === 'suspended') { try { actx.resume(); } catch (e) {} }
+      return actx;
+    }
+
+    // 浏览器要求「用户先交互过」才允许出声。用户打字/点页面时顺手把上下文唤醒，
+    // 这样后面 SSE 推音频过来就能直接播，不用等下一次点击。
+    (function primeOnGesture() {
+      var wake = function () {
+        try {
+          var c = ensureCtx();
+          if (c && c.state === 'suspended') c.resume();
+        } catch (e) {}
+        document.removeEventListener('pointerdown', wake, true);
+        document.removeEventListener('keydown', wake, true);
+      };
+      document.addEventListener('pointerdown', wake, true);
+      document.addEventListener('keydown', wake, true);
+    })();
+
+    function pcmToFloat(ab, bits) {
+      if (bits === 16) {
+        // Int16Array 要求字节数是 2 的倍数；宿主按 8KB 切帧可能切出奇数尾巴，
+        // 这里丢掉最后半字节（不到 1ms 音频），否则构造函数直接抛 RangeError。
+        var usable = ab.byteLength - (ab.byteLength % 2);
+        var i16 = new Int16Array(ab, 0, usable / 2);
+        var f = new Float32Array(i16.length);
+        for (var i = 0; i < i16.length; i++) f[i] = i16[i] / 32768;
+        return f;
+      }
+      // 32bit float 兜底（目前 Breeze 没用到）
+      return new Float32Array(ab);
+    }
+
+    function playPcm(frame) {
+      var ctx = ensureCtx();
+      if (!ctx) return;
+      var bin = atob(frame.audio || '');
+      if (!bin.length) return;
+      var bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+
+      var rate = frame.rate || 24000;
+      var chans = frame.channels || 1;
+      var samples = pcmToFloat(bytes.buffer, frame.bits || 16);
+      var frames = Math.floor(samples.length / chans);
+      if (!frames) return;
+
+      var buf = ctx.createBuffer(chans, frames, rate);
+      for (var c = 0; c < chans; c++) {
+        var ch = buf.getChannelData(c);
+        for (var n = 0; n < frames; n++) ch[n] = samples[n * chans + c] || 0;
+      }
+
+      var src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+
+      // 关键：用「比当前时间稍晚」的锚点串起来，片段之间不留空档、也不重叠。
+      var now = ctx.currentTime;
+      if (nextTime < now + 0.02) nextTime = now + 0.02;
+      src.start(nextTime);
+      nextTime += buf.duration;
+
+      queueLen++;
+      src.onended = function () {
+        queueLen--;
+        if (queueLen <= 0) { queueLen = 0; nextTime = 0; }
+      };
+    }
+
+    function stopAll() {
+      try { if (actx) actx.close(); } catch (e) {}
+      actx = null; nextTime = 0; queueLen = 0;
     }
 
     // 官方试听片段用独立 <audio>，不跟 SSE 朗读队列抢。
@@ -91,12 +149,32 @@ window.__ModuleLoader__.load({
     function connect() {
       if (es) return;
       es = new EventSource(B + '/stream');
+      // 宿主边合成边推 PCM：第一声 0.6 秒就到，不用等整段合成完。
+      es.addEventListener('pcm', function (ev) {
+        try { playPcm(JSON.parse(ev.data)); } catch (e) {}
+      });
+      // 兼容老版宿主（推整段 mp3）—— 万一没重启还留着旧进程，也不至于哑掉。
       es.addEventListener('audio', function (ev) {
-        try { playFrame(JSON.parse(ev.data)); } catch (e) {}
+        try { playMp3(JSON.parse(ev.data)); } catch (e) {}
       });
       es.addEventListener('error', function () {
         // 交给浏览器自动重连，不在这里手动重建
       });
+    }
+
+    // 老路径兜底：整段 mp3 走 <audio>。
+    var legacyAudio = new Audio();
+    var legacyUrl = null;
+    function playMp3(f) {
+      try {
+        var bin = atob(f.audio || '');
+        var bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        if (legacyUrl) URL.revokeObjectURL(legacyUrl);
+        legacyUrl = URL.createObjectURL(new Blob([bytes], { type: f.mime || 'audio/mpeg' }));
+        legacyAudio.src = legacyUrl;
+        legacyAudio.play().catch(function () {});
+      } catch (e) {}
     }
 
     var row = { marginTop: 10, display: 'flex', gap: 8, alignItems: 'center' };
